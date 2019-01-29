@@ -6,11 +6,12 @@ import json
 from tqdm import tqdm
 from keras.layers.embeddings import Embedding
 from keras.layers.recurrent import LSTM
-from keras.layers import Bidirectional, Conv1D, MaxPooling1D, Dropout, Dense, concatenate, Input, Reshape, Flatten
+from keras.layers import Bidirectional, Conv1D, MaxPooling1D, Dropout, Dense, concatenate, Input, Reshape, Flatten, BatchNormalization
 from keras.models import Model
-from keras.callbacks import EarlyStopping
+from keras.callbacks import EarlyStopping, ModelCheckpoint
 from pathlib import Path
 from keras.models import model_from_json
+from keras import regularizers
 from keras.preprocessing import text as txt, sequence
 
 Sentence = collections.namedtuple("Sentence", ["id", "sentence", "prev_1", "prev_2", "prev_3"])
@@ -70,22 +71,10 @@ def normalize_text(text):
     return text
 
 
-# imitates keras tokenizer used during training
-def normalize_text(text):
-    text = text.lower()
-    filters = '!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n'
-    split = " "
-    for c in filters:
-        text = text.replace(c, split)
-    return text
-
-
 def train():
-    # load validation and training data
     train_X, train_Y = load_data("da_tagging/utterances.train", True)
     valid_X, valid_Y = load_data("da_tagging/utterances.valid", True)
 
-    # represent labels as vectors
     lb = LabelBinarizer()
     lb.fit(train_Y)
     train_Y_bi = lb.fit_transform(train_Y)
@@ -111,8 +100,7 @@ def train():
     with open('dictionary.json', 'w') as dictionary_file:
         json.dump(word_index, dictionary_file)
 
-    # create an embedding matrix for the words we have in the dataset
-    embeddings_index = load_embeddings()  # load GloVe embeddings
+    embeddings_index = load_embeddings()
     embedding_matrix = np.zeros((len(word_index) + 1, 300))
     for word, i in tqdm(word_index.items()):
         embedding_vector = embeddings_index.get(word)
@@ -121,41 +109,44 @@ def train():
 
     target_input = Input(shape=(max_len,))
 
-    # target sentence - LSTM - CNN - Max pooling
-    # turns indices into embedding vectors
     e = Embedding(len(word_index) + 1, 300, weights=[embedding_matrix], input_length=max_len, trainable=False)(
         target_input)
-    b = Bidirectional(LSTM(300, dropout=0.5, recurrent_dropout=0.5))(e)
-    br = Reshape((600, 1))(b)
-    c1 = Conv1D(6, kernel_size=3, activation='relu', input_shape=(None, 600, 1))(br)  # change params
-    m = MaxPooling1D(pool_size=2)(c1)
-    m = Flatten()(m)
+    b = Bidirectional(LSTM(150, dropout=0.5, recurrent_dropout=0.5))(e) # it was 300 units, try 200?
+    br = Reshape((300, 1))(b)
+
+    filter_lengths = [3, 4, 5]
+    for i in filter_lengths:
+        br = Conv1D(100, kernel_size=i)(br)
+
+        # c1 = Conv1D(6, kernel_size=3, activation='relu', input_shape=(None, 600, 1))(br)  # change params
+        br = MaxPooling1D(pool_size=2)(br) # remove at all? after each?
+    br = BatchNormalization()(br)
+    m = Flatten()(br)
 
     # contexts
     X_train_1_pad, X_valid_1_pad, b1, input_1 = context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token,
-                                                              word_index)
+                                                              word_index, 1)
     X_train_2_pad, X_valid_2_pad, b2, input_2 = context_layer(X_train_2, X_valid_2, embedding_matrix, max_len, token,
-                                                              word_index)
-    X_train_3_pad, X_valid_3_pad, b3, input_3 = context_layer(X_train_3, X_valid_3, embedding_matrix, max_len, token,
-                                                              word_index)
+                                                              word_index, 2)
+    # X_train_3_pad, X_valid_3_pad, b3, input_3 = context_layer(X_train_3, X_valid_3, embedding_matrix, max_len, token,
+    #                                                           word_index, 3)
 
-    concatenated = concatenate([m, b1, b2, b3], axis=1)
-    out = Dense(31, activation='sigmoid')(concatenated)  # try softmax too
+    concatenated = concatenate([m, b1, b2], axis=1)
+    out = Dense(31, activation='sigmoid', kernel_regularizer=regularizers.l2(0.01))(concatenated)  # softmax?
 
-    model = Model([target_input, input_1, input_2, input_3], out)
+    model = Model([target_input, input_1, input_2], out)
     model.summary()
 
     model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
 
-    # fit the model with early stopping callback
-    earlystop = EarlyStopping(monitor='val_loss', min_delta=0, patience=3, verbose=0, mode='auto')
+    earlystop = EarlyStopping(monitor='val_acc', min_delta=0, patience=3, verbose=0, mode='auto')
+    checkpoint = ModelCheckpoint("weights-improvement-{epoch:02d}-{val_acc:.2f}.hdf5", monitor='val_acc', verbose=1,
+                                 save_best_only=True, mode='max')
 
-    model.fit([X_train_pad, X_train_1_pad, X_train_2_pad, X_train_3_pad], y=train_Y_bi, batch_size=512, epochs=500,
-              verbose=1, validation_data=([X_valid_pad, X_valid_1_pad, X_valid_2_pad, X_valid_3_pad], valid_Y_bi),
-              callbacks=[earlystop])
-    model.evaluate(X_valid_1_pad, valid_Y_bi, verbose=1)
+    model.fit([X_train_pad, X_train_1_pad, X_train_2_pad], y=train_Y_bi, batch_size=512, epochs=500,
+              verbose=1, validation_data=([X_valid_pad, X_valid_1_pad, X_valid_2_pad], valid_Y_bi),
+              callbacks=[earlystop, checkpoint])
 
-    # save the model
     model_json = model.to_json()
     with open('model.json', 'w') as json_file:
         json_file.write(model_json)
@@ -163,7 +154,7 @@ def train():
     model.save_weights('model.h5')
 
 
-def context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token, word_index):
+def context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token, word_index, n):
     X_train_1_seq = token.texts_to_sequences(X_train_1)
     X_valid_1_seq = token.texts_to_sequences(X_valid_1)
     X_train_1_pad = sequence.pad_sequences(X_train_1_seq, maxlen=82)
@@ -171,18 +162,26 @@ def context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token, word_i
 
     input_1 = Input(shape=(max_len,))
     e1 = Embedding(len(word_index) + 1, 300, weights=[embedding_matrix], input_length=max_len, trainable=False)(input_1)
-    b1 = Bidirectional(LSTM(300, dropout=0.5, recurrent_dropout=0.5))(e1)
+    b1 = Bidirectional(LSTM(150, dropout=0.5, recurrent_dropout=0.5))(e1)
 
-    # b1 = Dense(1024, activation='relu')(b1)
-    # b1 = Dropout(0.8)(b1)
+    b1 = Dense(300, activation='relu', kernel_regularizer=regularizers.l2(0.01))(b1)
+    if n == 1:
+        b1 = Dropout(0.6)(b1)
+    elif n == 2:
+        b1 = Dropout(0.7)(b1)
+    elif n == 3:
+        b1 = Dropout(0.8)(b1)
 
-    # todo: add other contexts -- maybe with higher dropout??
-    # the further -> the higher dropout? or some other things? how to represent that the furthert, the less important??
     return X_train_1_pad, X_valid_1_pad, b1, input_1
 
 
 def predict():
     test_X, _ = load_data("da_tagging/utterances.test", False)
+
+    train_X, train_Y = load_data("da_tagging/utterances.train", True)
+    valid_X, valid_Y = load_data("da_tagging/utterances.valid", True)
+
+    labels = list(set(train_Y + valid_Y))
 
     # load saved model
     with open('model.json', 'r') as f:
@@ -192,23 +191,35 @@ def predict():
     model.load_weights('model.h5')
 
     # load dictionary saved during training to use it for converting text to number vectors
-    with open('emotions_model/dictionary.json', 'r') as dictionary_file:
+    with open('dictionary.json', 'r') as dictionary_file:
         dictionary = json.load(dictionary_file)
 
-    # convert_text_to_index_array()
+    with open('result.txt', 'w') as r:
+        for x in test_X:
+            input = []
+            i = 0
+            id = ""
+            for X in x:
+                if i == 0:
+                    id = X
+                    i += 1
+                    continue
 
-    for x in test_X:
-        # for all text
-        tweet_text = normalize_text(x['sentence'])
-        words = convert_text_to_index_array(tweet_text, dictionary=dictionary)
-        words_pad = sequence.pad_sequences([words], maxlen=82)
+                if i > 3:
+                    break
 
-        pred = model.predict(words_pad)  # add contexts
+                text = normalize_text(X)
+                words = convert_text_to_index_array(text, dictionary=dictionary)
+                words_pad = sequence.pad_sequences([words], maxlen=82)
+                input.append(words_pad)
 
-        # predicted value - index of the max value
-        tonality = np.argmax(pred).item()
+                i += 1
 
-        # get the label, save to the file - id + label
+            pred = model.predict(input)
+
+            y_class = pred.argmax(axis=-1)
+            predicted_label = sorted(labels)[y_class.item()]
+            r.write(id + '\t' + predicted_label + '\n')
 
 
 if __name__ == '__main__':
