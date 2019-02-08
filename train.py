@@ -6,7 +6,8 @@ import json
 from tqdm import tqdm
 from keras.layers.embeddings import Embedding
 from keras.layers.recurrent import LSTM
-from keras.layers import Bidirectional, Conv1D, MaxPooling1D, Dropout, Dense, concatenate, Input, Reshape, Flatten, BatchNormalization
+from keras.layers import Bidirectional, Conv1D, MaxPooling1D, GlobalMaxPooling1D, Dropout, Dense, concatenate, Input, Reshape,\
+    Flatten, BatchNormalization
 from keras.models import Model
 from keras.callbacks import EarlyStopping, ModelCheckpoint
 from pathlib import Path
@@ -18,9 +19,8 @@ Sentence = collections.namedtuple("Sentence", ["id", "sentence", "prev_1", "prev
 
 
 def load_embeddings():
-    # load pre-trained word embeddings (GloVe, general crawl)
     embeddings_index = {}
-    with open('glove.840B.300d.txt') as f:
+    with open('glove.twitter.27B/glove.twitter.27B.100d.txt') as f:
         for line in f:
             values = line.split()
             word = values[0]
@@ -101,49 +101,55 @@ def train():
         json.dump(word_index, dictionary_file)
 
     embeddings_index = load_embeddings()
-    embedding_matrix = np.zeros((len(word_index) + 1, 300))
+    embedding_matrix = np.zeros((len(word_index) + 1, 100))
+    count = 0
     for word, i in tqdm(word_index.items()):
         embedding_vector = embeddings_index.get(word)
         if embedding_vector is not None:
             embedding_matrix[i] = embedding_vector
+        else:
+            embedding_matrix[i] = np.random.uniform(-0.25, 0.25, 100)
+            count += 1
+    print("words not in embeddings:" + str(count))
 
     target_input = Input(shape=(max_len,))
 
-    e = Embedding(len(word_index) + 1, 300, weights=[embedding_matrix], input_length=max_len, trainable=False)(
-        target_input)
-    b = Bidirectional(LSTM(150, dropout=0.5, recurrent_dropout=0.5))(e) # it was 300 units, try 200?
-    br = Reshape((300, 1))(b)
+    e = Embedding(len(word_index) + 1, 100, weights=[embedding_matrix], input_length=max_len, trainable=True)
 
-    filter_lengths = [3, 4, 5]
-    for i in filter_lengths:
-        br = Conv1D(100, kernel_size=i)(br)
-
-        # c1 = Conv1D(6, kernel_size=3, activation='relu', input_shape=(None, 600, 1))(br)  # change params
-        br = MaxPooling1D(pool_size=2)(br) # remove at all? after each?
-    br = BatchNormalization()(br)
-    m = Flatten()(br)
+    e1 = e(target_input)
 
     # contexts
-    X_train_1_pad, X_valid_1_pad, b1, input_1 = context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token,
-                                                              word_index, 1)
-    X_train_2_pad, X_valid_2_pad, b2, input_2 = context_layer(X_train_2, X_valid_2, embedding_matrix, max_len, token,
-                                                              word_index, 2)
-    # X_train_3_pad, X_valid_3_pad, b3, input_3 = context_layer(X_train_3, X_valid_3, embedding_matrix, max_len, token,
-    #                                                           word_index, 3)
+    X_train_1_pad, X_valid_1_pad, b1, input_1 = context_layer(X_train_1, X_valid_1, max_len, token, 1, e)
+    X_train_2_pad, X_valid_2_pad, b2, input_2 = context_layer(X_train_2, X_valid_2, max_len, token, 2, e)
+    # X_train_3_pad, X_valid_3_pad, b3, input_3 = context_layer(X_train_3, X_valid_3, max_len, token, 3, e)
 
-    concatenated = concatenate([m, b1, b2], axis=1)
-    out = Dense(31, activation='sigmoid', kernel_regularizer=regularizers.l2(0.01))(concatenated)  # softmax?
+    b = Bidirectional(LSTM(128, dropout=0.5, recurrent_dropout=0.5))(e1)
+    br = Reshape((256, 1))(b)
+
+    filter_lengths = [2, 3, 4]
+    for i in filter_lengths:
+        br = Conv1D(50, kernel_size=i)(br)
+
+        br = MaxPooling1D(pool_size=4)(br)
+    br = GlobalMaxPooling1D()(br)
+    br = BatchNormalization()(br)
+
+    # br = Flatten()(br)
+
+    concatenated = concatenate([br, b1, b2], axis=1)
+
+    out = Dense(31, activation='softmax', kernel_regularizer=regularizers.l2(0.01))(concatenated)
 
     model = Model([target_input, input_1, input_2], out)
     model.summary()
 
-    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.compile(loss='categorical_crossentropy', optimizer="rmsprop", metrics=['accuracy'])
 
-    earlystop = EarlyStopping(monitor='val_acc', min_delta=0, patience=3, verbose=0, mode='auto')
+    earlystop = EarlyStopping(monitor='val_acc', min_delta=0, patience=3, verbose=0, mode='auto', restore_best_weights=True)
     checkpoint = ModelCheckpoint("weights-improvement-{epoch:02d}-{val_acc:.2f}.hdf5", monitor='val_acc', verbose=1,
                                  save_best_only=True, mode='max')
 
-    model.fit([X_train_pad, X_train_1_pad, X_train_2_pad], y=train_Y_bi, batch_size=512, epochs=500,
+    model.fit([X_train_pad, X_train_1_pad, X_train_2_pad], y=train_Y_bi, batch_size=128, epochs=50,
               verbose=1, validation_data=([X_valid_pad, X_valid_1_pad, X_valid_2_pad], valid_Y_bi),
               callbacks=[earlystop, checkpoint])
 
@@ -154,17 +160,17 @@ def train():
     model.save_weights('model.h5')
 
 
-def context_layer(X_train_1, X_valid_1, embedding_matrix, max_len, token, word_index, n):
+def context_layer(X_train_1, X_valid_1, max_len, token, n, e):
     X_train_1_seq = token.texts_to_sequences(X_train_1)
     X_valid_1_seq = token.texts_to_sequences(X_valid_1)
     X_train_1_pad = sequence.pad_sequences(X_train_1_seq, maxlen=82)
     X_valid_1_pad = sequence.pad_sequences(X_valid_1_seq, maxlen=82)
 
     input_1 = Input(shape=(max_len,))
-    e1 = Embedding(len(word_index) + 1, 300, weights=[embedding_matrix], input_length=max_len, trainable=False)(input_1)
-    b1 = Bidirectional(LSTM(150, dropout=0.5, recurrent_dropout=0.5))(e1)
+    e1 = e(input_1)
+    b1 = Bidirectional(LSTM(128, dropout=0.5, recurrent_dropout=0.5))(e1)
 
-    b1 = Dense(300, activation='relu', kernel_regularizer=regularizers.l2(0.01))(b1)
+    b1 = Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(b1)
     if n == 1:
         b1 = Dropout(0.6)(b1)
     elif n == 2:
@@ -188,7 +194,7 @@ def predict():
         loaded_model_json = f.read()
 
     model = model_from_json(loaded_model_json)
-    model.load_weights('model.h5')
+    model.load_weights('weights-improvement-15-0.65.hdf5')
 
     # load dictionary saved during training to use it for converting text to number vectors
     with open('dictionary.json', 'r') as dictionary_file:
